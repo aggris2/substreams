@@ -118,7 +118,6 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 	// Statements run in order, several per round trip: a flush's statements are sent in batches
 	// of up to postgresBatchStatements or postgresBatchBytes, as one multi-statement query.
 	batch := postgresStatementBatch{tx: tx}
-	batch.query.WriteString(postgresFlushSavepoint)
 	var rowCount int
 	for _, entry := range allOperations {
 		normalQuery, undoQuery, err := d.prepareStatement(d.schemaName, entry)
@@ -132,7 +131,7 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 				l.logger.Debug("adding undo query from operation to transaction", zap.Stringer("op", entry), zap.String("query", undoQuery), zap.Uint64("ordinal", entry.ordinal))
 			}
 			if err := batch.add(ctx, entry, undoQuery); err != nil {
-				return 0, d.findFailedStatement(ctx, tx, allOperations, err)
+				return 0, err
 			}
 		}
 
@@ -140,13 +139,13 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 			l.logger.Debug("adding normal query from operation to transaction", zap.Stringer("op", entry), zap.String("query", normalQuery), zap.Uint64("ordinal", entry.ordinal))
 		}
 		if err := batch.add(ctx, entry, normalQuery); err != nil {
-			return 0, d.findFailedStatement(ctx, tx, allOperations, err)
+			return 0, err
 		}
 
 		rowCount++
 	}
 	if err := batch.flush(ctx); err != nil {
-		return 0, d.findFailedStatement(ctx, tx, allOperations, err)
+		return 0, err
 	}
 
 	pruneStart := time.Now()
@@ -783,89 +782,96 @@ func (d PostgresDialect) GetPrimaryKey(db *sql.DB, schemaName, tableName string)
 	return columns, nil
 }
 
-const (
-	postgresBatchBytes = 1 << 20
-
-	// postgresFlushSavepoint starts a flush's first batch, for findFailedStatement.
-	postgresFlushSavepoint = "SAVEPOINT substreams_flush;\n"
-)
+const postgresBatchBytes = 1 << 20
 
 // postgresBatchStatements is how many statements go in one round trip; a var for the benchmark.
 var postgresBatchStatements = 1000
-
-// findFailedStatement, once a batch failed, finds which statement did: a batch's error doesn't say.
-// It goes back to the start of the flush and runs its statements one by one, up to the one that
-// fails, for an error naming it. The flush fails either way, so this is only done for errors a
-// statement's data causes (invalid data, constraint, raised by a trigger), which fail again at the
-// same statement. Others (a lock timeout, a deadlock, the connection) could pass this time.
-func (d PostgresDialect) findFailedStatement(ctx context.Context, tx Tx, operations []*Operation, batchErr error) error {
-	var pqErr *pq.Error
-	if !errors.As(batchErr, &pqErr) {
-		return batchErr
-	}
-	switch pqErr.Code.Class() {
-	case "22", "23", "P0":
-	default:
-		return batchErr
-	}
-	if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT substreams_flush"); err != nil {
-		return batchErr
-	}
-	for _, op := range operations {
-		normalQuery, undoQuery, err := d.prepareStatement(d.schemaName, op)
-		if err != nil {
-			return batchErr
-		}
-		for _, query := range []string{undoQuery, normalQuery} {
-			if query == "" {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, query); err != nil {
-				return fmt.Errorf("executing query %q: %w", query, err)
-			}
-		}
-	}
-	return batchErr
-}
 
 // postgresStatementBatch sends statements to the database several at a time, in the order they
 // were added, as one multi-statement query (the simple query protocol runs them in order, in the
 // flush's transaction, with the same statement_timestamp()).
 type postgresStatementBatch struct {
-	tx         Tx
-	query      strings.Builder
-	statements int
+	tx    Tx
+	query strings.Builder
+	// starts has where each statement starts in query.
+	starts []int
 	// first and last are the operations of the batch's first and last statements, for errors.
 	first, last *Operation
 }
 
 func (b *postgresStatementBatch) add(ctx context.Context, op *Operation, statement string) error {
-	if b.statements == 0 {
+	if len(b.starts) == 0 {
 		b.first = op
 	}
 	b.last = op
+	b.starts = append(b.starts, b.query.Len())
 	b.query.WriteString(statement)
 	if !strings.HasSuffix(statement, ";") {
 		b.query.WriteByte(';')
 	}
 	b.query.WriteByte('\n')
-	b.statements++
-	if b.statements >= postgresBatchStatements || b.query.Len() >= postgresBatchBytes {
+	if len(b.starts) >= postgresBatchStatements || b.query.Len() >= postgresBatchBytes {
 		return b.flush(ctx)
 	}
 	return nil
 }
 
 func (b *postgresStatementBatch) flush(ctx context.Context) error {
-	if b.statements == 0 {
+	if len(b.starts) == 0 {
 		return nil
 	}
 	start := time.Now()
 	if _, err := b.tx.ExecContext(ctx, b.query.String()); err != nil {
-		return fmt.Errorf("executing %d statements, from operation %s to %s: %w", b.statements, b.first, b.last, err)
+		return b.describeFailure(err)
 	}
 	QueryExecutionDuration.AddInt64(time.Since(start).Nanoseconds(), "batch")
 	b.query.Reset()
-	b.statements = 0
+	b.starts = b.starts[:0]
 	return nil
+}
+
+// describeFailure tells what Postgres says about the failing statement, as a batch's error doesn't
+// say which one it is: its position when it gives one (a value that isn't valid for its column),
+// and the row or the trigger otherwise (a constraint names the key, a trigger where it raised).
+func (b *postgresStatementBatch) describeFailure(err error) error {
+	description := fmt.Sprintf("executing %d statements, from operation %s to %s", len(b.starts), b.first, b.last)
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		if statement := b.statementAt(pqErr.Position); statement != "" {
+			description += fmt.Sprintf(", at statement %q", statement)
+		}
+		if pqErr.Detail != "" {
+			description += ", " + pqErr.Detail
+		}
+		if pqErr.Where != "" {
+			description += ", " + pqErr.Where
+		}
+	}
+	return fmt.Errorf("%s: %w", description, err)
+}
+
+// statementAt gives the statement at a Postgres error position, a 1-based count of characters in
+// the query, "" if it gives none.
+func (b *postgresStatementBatch) statementAt(position string) string {
+	characters, err := strconv.Atoi(position)
+	if err != nil || characters < 1 {
+		return ""
+	}
+	query := b.query.String()
+	offset := 0
+	for i := range query {
+		if characters--; characters == 0 {
+			offset = i
+			break
+		}
+	}
+	index, found := slices.BinarySearch(b.starts, offset)
+	if !found {
+		index--
+	}
+	end := len(query)
+	if index+1 < len(b.starts) {
+		end = b.starts[index+1]
+	}
+	return strings.TrimSpace(query[b.starts[index]:end])
 }

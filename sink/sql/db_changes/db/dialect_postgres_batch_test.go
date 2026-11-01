@@ -3,13 +3,11 @@ package db
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/lib/pq"
-	"github.com/lib/pq/pqerror"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,48 +62,74 @@ func TestPostgresStatementBatch(t *testing.T) {
 	})
 }
 
-// A statement failing in a batch is named in the error, whichever batch of the flush it is in.
-func TestPostgresFlush_ErrorNamesTheFailedStatement(t *testing.T) {
+func TestPostgresFlush_ErrorSaysWhatFailed(t *testing.T) {
 	ctx := context.Background()
-	l := pgTestLoader(t, pgTestSchema(t), true)
+	schema := pgTestSchema(t)
+	l := pgTestLoader(t, schema, true)
 	require.NoError(t, l.InsertCursor(ctx, testModuleHash, pgCursor(1, 1)))
 
-	// A row already there, which the flush's insert will conflict with.
 	require.NoError(t, l.Insert("acc", map[string]string{"id": "taken"}, map[string]FieldData{"n": {Value: "1"}}, nil))
 	_, err := l.Flush(ctx, testModuleHash, pgCursor(2, 2), 2)
 	require.NoError(t, err)
 
-	for i := range postgresBatchStatements + 10 {
-		require.NoError(t, l.Insert("acc", map[string]string{"id": fmt.Sprintf("r%d", i)}, map[string]FieldData{"n": {Value: "1"}}, nil))
+	// A failed flush keeps its pending changes: each case starts from a new loader.
+	loaderWithRows := func() *Loader {
+		l := pgTestLoader(t, schema, true)
+		for i := range postgresBatchStatements + 10 {
+			require.NoError(t, l.Insert("acc", map[string]string{"id": fmt.Sprintf("r%d", i)}, map[string]FieldData{"n": {Value: "1"}}, nil))
+		}
+		return l
 	}
-	require.NoError(t, l.Insert("acc", map[string]string{"id": "taken"}, map[string]FieldData{"n": {Value: "2"}}, nil))
+	countRows := func() (count int) {
+		require.NoError(t, l.DB.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.acc`, EscapeIdentifier(l.dsn.Schema()))).Scan(&count))
+		return count
+	}
 
-	_, err = l.Flush(ctx, testModuleHash, pgCursor(3, 3), 3)
-	require.ErrorContains(t, err, `executing query "INSERT INTO`)
-	require.ErrorContains(t, err, `'taken'`)
-	require.ErrorContains(t, err, "duplicate key")
+	t.Run("a constraint names the key", func(t *testing.T) {
+		l := loaderWithRows()
+		require.NoError(t, l.Insert("acc", map[string]string{"id": "taken"}, map[string]FieldData{"n": {Value: "2"}}, nil))
+		_, err := l.Flush(ctx, testModuleHash, pgCursor(3, 3), 3)
+		require.ErrorContains(t, err, "Key (id)=(taken) already exists")
+		require.ErrorContains(t, err, "duplicate key")
+		assert.Equal(t, 1, countRows(), "nothing of the flush stays")
+	})
 
-	// Nothing of the flush stays.
-	var count int
-	require.NoError(t, l.DB.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.acc`, EscapeIdentifier(l.dsn.Schema()))).Scan(&count))
-	assert.Equal(t, 1, count)
+	t.Run("an invalid value names its statement", func(t *testing.T) {
+		l := loaderWithRows()
+		require.NoError(t, l.Insert("acc", map[string]string{"id": "bad"}, map[string]FieldData{"n": {Value: "not-a-number"}}, nil))
+		_, err := l.Flush(ctx, testModuleHash, pgCursor(3, 3), 3)
+		require.ErrorContains(t, err, "at statement")
+		require.ErrorContains(t, err, "not-a-number")
+		assert.NotContains(t, err.Error(), "'r0'", "only the failing statement")
+		assert.Equal(t, 1, countRows(), "nothing of the flush stays")
+	})
 }
 
-// An error that could pass this time isn't replayed, as the flush fails either way.
-func TestFindFailedStatement_OnlyReplaysDataErrors(t *testing.T) {
+func TestPostgresStatementBatch_StatementAt(t *testing.T) {
 	ctx := context.Background()
-	d := PostgresDialect{}
-	for code, replays := range map[pqerror.Code]bool{"23505": true, "22P02": true, "P0001": true, "55P03": false, "40P01": false} {
-		tx := &countingTx{}
-		batchErr := fmt.Errorf("batch: %w", &pq.Error{Code: code})
-		assert.ErrorIs(t, d.findFailedStatement(ctx, tx, nil, batchErr), batchErr, string(code))
-		assert.Equal(t, replays, len(tx.sent) > 0, string(code))
-	}
+	tx := &failingTx{err: &pq.Error{Message: "invalid input", Position: "31"}}
+	batch := postgresStatementBatch{tx: tx}
+	op := &Operation{}
+	require.NoError(t, batch.add(ctx, op, "SELECT 'é';"))
+	require.NoError(t, batch.add(ctx, op, "INSERT INTO t VALUES ('bad');"))
+	require.NoError(t, batch.add(ctx, op, "SELECT 3;"))
 
-	tx := &countingTx{}
-	notPostgres := errors.New("connection lost")
-	assert.ErrorIs(t, d.findFailedStatement(ctx, tx, nil, notPostgres), notPostgres)
-	assert.Empty(t, tx.sent)
+	err := batch.flush(ctx)
+	require.ErrorContains(t, err, `at statement "INSERT INTO t VALUES ('bad');"`)
+	require.ErrorContains(t, err, "invalid input")
+
+	assert.Empty(t, batch.statementAt(""))
+	assert.Equal(t, "SELECT 'é';", batch.statementAt("1"))
+	assert.Equal(t, "SELECT 3;", batch.statementAt("44"))
+}
+
+type failingTx struct {
+	countingTx
+	err error
+}
+
+func (t *failingTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return nil, t.err
 }
 
 // BenchmarkPostgresFlush compares a flush sent one statement per round trip with the same flush

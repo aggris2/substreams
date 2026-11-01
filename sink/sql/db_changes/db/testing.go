@@ -139,7 +139,6 @@ func (t *TestTx) Commit() error {
 
 func (t *TestTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	// A batch of statements (see postgresStatementBatch) is recorded as its statements.
-	query = strings.TrimPrefix(query, postgresFlushSavepoint)
 	if statements := strings.SplitAfter(strings.TrimSuffix(query, "\n"), ";\n"); len(statements) > 1 {
 		for _, statement := range statements {
 			t.queries = append(t.queries, strings.TrimSuffix(statement, "\n"))
