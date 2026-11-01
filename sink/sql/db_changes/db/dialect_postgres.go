@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
 	"github.com/streamingfast/cli"
 	sink "github.com/streamingfast/substreams/sink"
 	"go.uber.org/zap"
@@ -116,6 +118,7 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 	// Statements run in order, several per round trip: a flush's statements are sent in batches
 	// of up to postgresBatchStatements or postgresBatchBytes, as one multi-statement query.
 	batch := postgresStatementBatch{tx: tx}
+	batch.query.WriteString(postgresFlushSavepoint)
 	var rowCount int
 	for _, entry := range allOperations {
 		normalQuery, undoQuery, err := d.prepareStatement(d.schemaName, entry)
@@ -129,7 +132,7 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 				l.logger.Debug("adding undo query from operation to transaction", zap.Stringer("op", entry), zap.String("query", undoQuery), zap.Uint64("ordinal", entry.ordinal))
 			}
 			if err := batch.add(ctx, entry, undoQuery); err != nil {
-				return 0, err
+				return 0, d.findFailedStatement(ctx, tx, allOperations, err)
 			}
 		}
 
@@ -137,13 +140,13 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 			l.logger.Debug("adding normal query from operation to transaction", zap.Stringer("op", entry), zap.String("query", normalQuery), zap.Uint64("ordinal", entry.ordinal))
 		}
 		if err := batch.add(ctx, entry, normalQuery); err != nil {
-			return 0, err
+			return 0, d.findFailedStatement(ctx, tx, allOperations, err)
 		}
 
 		rowCount++
 	}
 	if err := batch.flush(ctx); err != nil {
-		return 0, err
+		return 0, d.findFailedStatement(ctx, tx, allOperations, err)
 	}
 
 	pruneStart := time.Now()
@@ -780,10 +783,43 @@ func (d PostgresDialect) GetPrimaryKey(db *sql.DB, schemaName, tableName string)
 	return columns, nil
 }
 
-const postgresBatchBytes = 1 << 20
+const (
+	postgresBatchBytes = 1 << 20
+
+	// postgresFlushSavepoint starts a flush's first batch, for findFailedStatement.
+	postgresFlushSavepoint = "SAVEPOINT substreams_flush;\n"
+)
 
 // postgresBatchStatements is how many statements go in one round trip; a var for the benchmark.
 var postgresBatchStatements = 1000
+
+// findFailedStatement, once a batch failed, finds which statement did: a batch's error doesn't say.
+// It goes back to the start of the flush and runs its statements one by one, up to the one that
+// fails, for an error naming it. The flush fails either way.
+func (d PostgresDialect) findFailedStatement(ctx context.Context, tx Tx, operations []*Operation, batchErr error) error {
+	var pqErr *pq.Error
+	if !errors.As(batchErr, &pqErr) {
+		return batchErr // the connection or the context, not a statement
+	}
+	if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT substreams_flush"); err != nil {
+		return batchErr
+	}
+	for _, op := range operations {
+		normalQuery, undoQuery, err := d.prepareStatement(d.schemaName, op)
+		if err != nil {
+			return batchErr
+		}
+		for _, query := range []string{undoQuery, normalQuery} {
+			if query == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, query); err != nil {
+				return fmt.Errorf("executing query %q: %w", query, err)
+			}
+		}
+	}
+	return batchErr
+}
 
 // postgresStatementBatch sends statements to the database several at a time, in the order they
 // were added, as one multi-statement query (the simple query protocol runs them in order, in the

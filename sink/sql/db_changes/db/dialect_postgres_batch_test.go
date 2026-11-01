@@ -61,6 +61,33 @@ func TestPostgresStatementBatch(t *testing.T) {
 	})
 }
 
+// A statement failing in a batch is named in the error, whichever batch of the flush it is in.
+func TestPostgresFlush_ErrorNamesTheFailedStatement(t *testing.T) {
+	ctx := context.Background()
+	l := pgTestLoader(t, pgTestSchema(t), true)
+	require.NoError(t, l.InsertCursor(ctx, testModuleHash, pgCursor(1, 1)))
+
+	// A row already there, which the flush's insert will conflict with.
+	require.NoError(t, l.Insert("acc", map[string]string{"id": "taken"}, map[string]FieldData{"n": {Value: "1"}}, nil))
+	_, err := l.Flush(ctx, testModuleHash, pgCursor(2, 2), 2)
+	require.NoError(t, err)
+
+	for i := range postgresBatchStatements + 10 {
+		require.NoError(t, l.Insert("acc", map[string]string{"id": fmt.Sprintf("r%d", i)}, map[string]FieldData{"n": {Value: "1"}}, nil))
+	}
+	require.NoError(t, l.Insert("acc", map[string]string{"id": "taken"}, map[string]FieldData{"n": {Value: "2"}}, nil))
+
+	_, err = l.Flush(ctx, testModuleHash, pgCursor(3, 3), 3)
+	require.ErrorContains(t, err, `executing query "INSERT INTO`)
+	require.ErrorContains(t, err, `'taken'`)
+	require.ErrorContains(t, err, "duplicate key")
+
+	// Nothing of the flush stays.
+	var count int
+	require.NoError(t, l.DB.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.acc`, EscapeIdentifier(l.dsn.Schema()))).Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
 // BenchmarkPostgresFlush compares a flush sent one statement per round trip with the same flush
 // sent in batches. The gain grows with the latency to the database, so point PG_DSN at a remote
 // one to see it over a network:
