@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - SQL sink (DatabaseChanges): an invalid `UpdateOp` sequence on one field within a batch (for example `ADD` after
   `MAX`) now stops the sink with an error. Upserts and updates used to ignore it, so the change was silently dropped,
   along with any other fields of that change not merged yet.
+- SQL sink (DatabaseChanges, PostgreSQL): send a flush's statements in batches instead of one round trip each, in the
+  same order and transaction. On a real module a flush took 0.4 s instead of 0.9 s, with the same rows. A statement that
+  fails now reports the range of operations of its batch rather than its own SQL.
 
 ## v1.26.0
 

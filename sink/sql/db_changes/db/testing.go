@@ -138,7 +138,14 @@ func (t *TestTx) Commit() error {
 }
 
 func (t *TestTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	t.queries = append(t.queries, query)
+	// A batch of statements (see postgresStatementBatch) is recorded as its statements.
+	if statements := strings.SplitAfter(strings.TrimSuffix(query, "\n"), ";\n"); len(statements) > 1 {
+		for _, statement := range statements {
+			t.queries = append(t.queries, strings.TrimSuffix(statement, "\n"))
+		}
+		return &testResult{rowsAffected: 1}, nil
+	}
+	t.queries = append(t.queries, strings.TrimSuffix(query, "\n"))
 	if t.NoRowsAffected != nil && t.NoRowsAffected(query) {
 		return &testResult{rowsAffected: 0}, nil
 	}

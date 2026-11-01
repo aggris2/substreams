@@ -113,6 +113,9 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 		return cmp.Compare(a.ordinal, b.ordinal)
 	})
 
+	// Statements run in order, several per round trip: a flush's statements are sent in batches
+	// of up to postgresBatchStatements or postgresBatchBytes, as one multi-statement query.
+	batch := postgresStatementBatch{tx: tx}
 	var rowCount int
 	for _, entry := range allOperations {
 		normalQuery, undoQuery, err := d.prepareStatement(d.schemaName, entry)
@@ -120,33 +123,27 @@ func (d PostgresDialect) Flush(tx Tx, ctx context.Context, l *Loader, outputModu
 			return 0, fmt.Errorf("failed to prepare statement: %w", err)
 		}
 
-		// Execute undo query first (if present) to save state before modifying
+		// The undo query first (if present), to save the row's state before it changes.
 		if undoQuery != "" {
 			if l.tracer.Enabled() {
 				l.logger.Debug("adding undo query from operation to transaction", zap.Stringer("op", entry), zap.String("query", undoQuery), zap.Uint64("ordinal", entry.ordinal))
 			}
-
-			undoStart := time.Now()
-			if _, err := tx.ExecContext(ctx, undoQuery); err != nil {
-				return 0, fmt.Errorf("executing undo query %q: %w", undoQuery, err)
+			if err := batch.add(ctx, entry, undoQuery); err != nil {
+				return 0, err
 			}
-			undoDuration := time.Since(undoStart)
-			QueryExecutionDuration.AddInt64(undoDuration.Nanoseconds(), "undo")
 		}
 
-		// Execute normal query
 		if l.tracer.Enabled() {
 			l.logger.Debug("adding normal query from operation to transaction", zap.Stringer("op", entry), zap.String("query", normalQuery), zap.Uint64("ordinal", entry.ordinal))
 		}
-
-		normalStart := time.Now()
-		if _, err := tx.ExecContext(ctx, normalQuery); err != nil {
-			return 0, fmt.Errorf("executing normal query %q: %w", normalQuery, err)
+		if err := batch.add(ctx, entry, normalQuery); err != nil {
+			return 0, err
 		}
-		normalDuration := time.Since(normalStart)
-		QueryExecutionDuration.AddInt64(normalDuration.Nanoseconds(), "normal")
 
 		rowCount++
+	}
+	if err := batch.flush(ctx); err != nil {
+		return 0, err
 	}
 
 	pruneStart := time.Now()
@@ -781,4 +778,51 @@ func (d PostgresDialect) GetPrimaryKey(db *sql.DB, schemaName, tableName string)
 	}
 
 	return columns, nil
+}
+
+const (
+	postgresBatchStatements = 1000
+	postgresBatchBytes      = 1 << 20
+)
+
+// postgresStatementBatch sends statements to the database several at a time, in the order they
+// were added, as one multi-statement query (the simple query protocol runs them in order, in the
+// flush's transaction).
+type postgresStatementBatch struct {
+	tx         Tx
+	query      strings.Builder
+	statements int
+	// first and last are the operations of the batch's first and last statements, for errors.
+	first, last *Operation
+}
+
+func (b *postgresStatementBatch) add(ctx context.Context, op *Operation, statement string) error {
+	if b.statements == 0 {
+		b.first = op
+	}
+	b.last = op
+	b.query.WriteString(statement)
+	if !strings.HasSuffix(statement, ";") {
+		b.query.WriteByte(';')
+	}
+	b.query.WriteByte('\n')
+	b.statements++
+	if b.statements >= postgresBatchStatements || b.query.Len() >= postgresBatchBytes {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *postgresStatementBatch) flush(ctx context.Context) error {
+	if b.statements == 0 {
+		return nil
+	}
+	start := time.Now()
+	if _, err := b.tx.ExecContext(ctx, b.query.String()); err != nil {
+		return fmt.Errorf("executing %d statements, from operation %s to %s: %w", b.statements, b.first, b.last, err)
+	}
+	QueryExecutionDuration.AddInt64(time.Since(start).Nanoseconds(), "batch")
+	b.query.Reset()
+	b.statements = 0
+	return nil
 }
