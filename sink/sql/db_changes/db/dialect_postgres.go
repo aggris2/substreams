@@ -795,11 +795,18 @@ var postgresBatchStatements = 1000
 
 // findFailedStatement, once a batch failed, finds which statement did: a batch's error doesn't say.
 // It goes back to the start of the flush and runs its statements one by one, up to the one that
-// fails, for an error naming it. The flush fails either way.
+// fails, for an error naming it. The flush fails either way, so this is only done for errors a
+// statement's data causes (invalid data, constraint, raised by a trigger), which fail again at the
+// same statement. Others (a lock timeout, a deadlock, the connection) could pass this time.
 func (d PostgresDialect) findFailedStatement(ctx context.Context, tx Tx, operations []*Operation, batchErr error) error {
 	var pqErr *pq.Error
 	if !errors.As(batchErr, &pqErr) {
-		return batchErr // the connection or the context, not a statement
+		return batchErr
+	}
+	switch pqErr.Code.Class() {
+	case "22", "23", "P0":
+	default:
+		return batchErr
 	}
 	if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT substreams_flush"); err != nil {
 		return batchErr
@@ -823,7 +830,7 @@ func (d PostgresDialect) findFailedStatement(ctx context.Context, tx Tx, operati
 
 // postgresStatementBatch sends statements to the database several at a time, in the order they
 // were added, as one multi-statement query (the simple query protocol runs them in order, in the
-// flush's transaction).
+// flush's transaction, with the same statement_timestamp()).
 type postgresStatementBatch struct {
 	tx         Tx
 	query      strings.Builder

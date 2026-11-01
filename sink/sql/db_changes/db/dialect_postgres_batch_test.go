@@ -3,10 +3,13 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/lib/pq"
+	"github.com/lib/pq/pqerror"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -86,6 +89,23 @@ func TestPostgresFlush_ErrorNamesTheFailedStatement(t *testing.T) {
 	var count int
 	require.NoError(t, l.DB.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.acc`, EscapeIdentifier(l.dsn.Schema()))).Scan(&count))
 	assert.Equal(t, 1, count)
+}
+
+// An error that could pass this time isn't replayed, as the flush fails either way.
+func TestFindFailedStatement_OnlyReplaysDataErrors(t *testing.T) {
+	ctx := context.Background()
+	d := PostgresDialect{}
+	for code, replays := range map[pqerror.Code]bool{"23505": true, "22P02": true, "P0001": true, "55P03": false, "40P01": false} {
+		tx := &countingTx{}
+		batchErr := fmt.Errorf("batch: %w", &pq.Error{Code: code})
+		assert.ErrorIs(t, d.findFailedStatement(ctx, tx, nil, batchErr), batchErr, string(code))
+		assert.Equal(t, replays, len(tx.sent) > 0, string(code))
+	}
+
+	tx := &countingTx{}
+	notPostgres := errors.New("connection lost")
+	assert.ErrorIs(t, d.findFailedStatement(ctx, tx, nil, notPostgres), notPostgres)
+	assert.Empty(t, tx.sent)
 }
 
 // BenchmarkPostgresFlush compares a flush sent one statement per round trip with the same flush
