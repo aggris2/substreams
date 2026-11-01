@@ -780,10 +780,10 @@ func (d PostgresDialect) GetPrimaryKey(db *sql.DB, schemaName, tableName string)
 	return columns, nil
 }
 
-const (
-	postgresBatchStatements = 1000
-	postgresBatchBytes      = 1 << 20
-)
+const postgresBatchBytes = 1 << 20
+
+// postgresBatchStatements is how many statements go in one round trip; a var for the benchmark.
+var postgresBatchStatements = 1000
 
 // postgresStatementBatch sends statements to the database several at a time, in the order they
 // were added, as one multi-statement query (the simple query protocol runs them in order, in the

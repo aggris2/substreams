@@ -60,3 +60,36 @@ func TestPostgresStatementBatch(t *testing.T) {
 		assert.Equal(t, []string{"SELECT 1;\n"}, tx.sent)
 	})
 }
+
+// BenchmarkPostgresFlush compares a flush sent one statement per round trip with the same flush
+// sent in batches. The gain grows with the latency to the database, so point PG_DSN at a remote
+// one to see it over a network:
+//
+//	PG_DSN="psql://user:pass@host:5432/db?sslmode=disable" go test ./sink/sql/db_changes/db/ -run '^$' -bench BenchmarkPostgresFlush
+func BenchmarkPostgresFlush(b *testing.B) {
+	const rows = 1000
+	defer func(previous int) { postgresBatchStatements = previous }(postgresBatchStatements)
+
+	for _, statements := range []int{1, postgresBatchStatements} {
+		b.Run(fmt.Sprintf("statements_per_round_trip=%d", statements), func(b *testing.B) {
+			postgresBatchStatements = statements
+			ctx := context.Background()
+			l := pgTestLoader(b, pgTestSchema(b), true)
+			require.NoError(b, l.InsertCursor(ctx, testModuleHash, pgCursor(1, 1)))
+
+			block := uint64(1)
+			for b.Loop() {
+				b.StopTimer()
+				block++
+				for i := range rows {
+					id := map[string]string{"id": fmt.Sprintf("%d-%d", block, i)}
+					require.NoError(b, l.Insert("acc", id, map[string]FieldData{"n": {Value: "1"}}, nil))
+				}
+				b.StartTimer()
+				_, err := l.Flush(ctx, testModuleHash, pgCursor(block, block), block)
+				require.NoError(b, err)
+			}
+			b.ReportMetric(float64(rows)*float64(b.N)/b.Elapsed().Seconds(), "rows/s")
+		})
+	}
+}

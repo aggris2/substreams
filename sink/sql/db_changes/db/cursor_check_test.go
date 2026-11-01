@@ -23,7 +23,7 @@ import (
 
 // pgTestSchema creates a fresh schema with the cursors and history tables plus an `acc` table, and
 // returns the DSN pointing at it. The test is skipped unless PG_DSN is set.
-func pgTestSchema(t *testing.T) string {
+func pgTestSchema(t testing.TB) string {
 	t.Helper()
 	dsnString := os.Getenv("PG_DSN")
 	if dsnString == "" {
@@ -53,7 +53,7 @@ func pgTestSchema(t *testing.T) string {
 	return scoped
 }
 
-func pgTestLoader(t *testing.T, dsnString string, loadTables bool) *Loader {
+func pgTestLoader(t testing.TB, dsnString string, loadTables bool) *Loader {
 	t.Helper()
 	dsn, err := ParseDSN(dsnString)
 	require.NoError(t, err)
